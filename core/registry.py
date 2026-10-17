@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from graphics.items.base import LayoutItem
 from graphics.items.buffer_stop_item import BufferStopItem
+from graphics.items.connector_item import ConnectorItem
 from graphics.items.platform_item import PlatformItem
 from graphics.items.section_marker_item import SectionMarkerItem
 from graphics.items.segment_item import SegmentItem
@@ -23,7 +24,15 @@ class ElementType:
 _TYPES: dict[str, ElementType] = {}
 
 # 元素面板中展示/可放置的类型（按 order 排序）
-TOOL_TYPE_IDS: tuple[str, ...] = ("segment", "turnout", "platform", "buffer_stop", "section_marker", "text")
+TOOL_TYPE_IDS: tuple[str, ...] = (
+    "segment",
+    "turnout",
+    "platform",
+    "buffer_stop",
+    "section_marker",
+    "text",
+    "connector",
+)
 
 
 def register(cls: type, name: str, order: int) -> ElementType:
@@ -60,3 +69,4 @@ register(PlatformItem, "站台", 30)
 register(BufferStopItem, "车挡", 40)
 register(SectionMarkerItem, "区间标记", 50)
 register(TextItem, "文字标注", 60)
+register(ConnectorItem, "联络线", 70)

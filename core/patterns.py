@@ -11,13 +11,14 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QPointF
 
-from core import geometry, turnout
+from core import geometry, platform, turnout
 
 PATTERN_LABELS: tuple[tuple[str, str], ...] = (
     ("crossover_single", "单渡线"),
     ("crossover_double", "交叉渡线"),
     ("siding", "存车线"),
     ("turnback", "折返线"),
+    ("island_platform", "岛式站台"),
 )
 PATTERN_IDS: tuple[str, ...] = tuple(kind for kind, _ in PATTERN_LABELS)
 PATTERN_NAMES: dict[str, str] = dict(PATTERN_LABELS)
@@ -72,6 +73,11 @@ class PatternStyle:
     new_line_width: float = 0.0  # 新生成股道的线宽
     new_line_color: str = ""
     taper_length: float = 0.0  # 正线→站线的过渡长度
+    # 岛式站台的默认配色（空值 = 用图元自带默认）
+    platform_fill: str = ""
+    platform_fill2: str = ""
+    platform_line: str = ""
+    platform_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -190,6 +196,42 @@ def _segment(start: QPointF, angle: float, length: float, paint: LinePaint = Lin
     if paint.color:
         props["color"] = paint.color
     return _element("segment", start, angle, **props)
+
+
+def _island_platform(
+    frame: Frame,
+    t: float,
+    lean: int,
+    track_length: float,
+    paint_a: LinePaint = LinePaint(),
+    paint_b: LinePaint = LinePaint(),
+    style: PatternStyle = PatternStyle(),
+) -> list[dict]:
+    """岛式站台：两条股道正中间放置站台，两侧各留默认间隔（见 core.platform，取自 example5）。
+
+    站台沿股道方向居中在光标处，长度取所选股道的一半（生成后仍可用手柄调整）。
+    """
+    metrics = platform.island_metrics(frame.spacing, paint_a.width, paint_b.width)
+    if not platform.fits_island(metrics):
+        raise PatternError("两条股道间距太小，放不下留出标准间隔的站台")
+    length = max(platform.PLATFORM_MIN_LENGTH, platform.PLATFORM_LENGTH_RATIO * track_length)
+    direction = 1 if lean >= 0 else -1
+    angle = frame.u_angle if direction > 0 else geometry.normalize_angle(frame.u_angle + 180.0)
+    start = frame.point(t - direction * length / 2.0, metrics.center)
+    props: dict = {
+        "length": round(length, 3),
+        "width": round(metrics.width, 3),
+        "kind": "岛式",
+    }
+    if style.platform_fill:
+        props["fill_color"] = style.platform_fill
+    if style.platform_fill2:
+        props["fill_color2"] = style.platform_fill2
+    if style.platform_line:
+        props["line_color"] = style.platform_line
+    if style.platform_text:
+        props["text_color"] = style.platform_text
+    return [_element("platform", start, angle, **props)]
 
 
 def _buffer_stop(pos: QPointF, rotation: float) -> dict:
@@ -352,4 +394,6 @@ def build(kind: str, a: Track, b: Track, t: float = 0.0, lean: int = 1, style: P
         return _crossover(frame, t, direction, True, paint_a, paint_b, style)
     if kind == "siding":
         return _siding(frame, t, direction, a.length, paint_a, paint_b, style)
+    if kind == "island_platform":
+        return _island_platform(frame, t, direction, a.length, paint_a, paint_b, style)
     return _turnback(frame, t, direction, a.length, paint_a, paint_b, style)

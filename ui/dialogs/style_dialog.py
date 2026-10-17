@@ -34,8 +34,11 @@ class StyleDialog(QDialog):
         self._taper.setValue(float(current.taper_length))
 
         self._platform_fill = ColorButton(current.platform_fill, self, "选择车站填充色")
+        self._platform_fill2 = ColorButton(current.platform_fill2, self, "选择车站副色（双色/渐变用）")
         self._platform_line = ColorButton(current.platform_line, self, "选择车站描边色")
         self._platform_text = ColorButton(current.platform_text, self, "选择车站文字色")
+
+        self._break_crossings = QCheckBox("新绘制的股道在交叉处断开（两条股道交叉时互相让开）", self)
 
         form = QFormLayout()
         form.addRow("", self._distinguish)
@@ -45,8 +48,10 @@ class StyleDialog(QDialog):
         form.addRow("站线颜色：", self._branch_color)
         form.addRow("过渡长度：", self._taper)
         form.addRow("车站填充色：", self._platform_fill)
+        form.addRow("车站副色：", self._platform_fill2)
         form.addRow("车站描边色：", self._platform_line)
         form.addRow("车站文字色：", self._platform_text)
+        form.addRow("", self._break_crossings)
 
         hint = QLabel(
             "「保存」只影响之后新建的股道/站台与自动生成的组合配线；"
@@ -107,8 +112,10 @@ class StyleDialog(QDialog):
         self._branch_color.set_color(defaults.branch.color)
         self._taper.setValue(defaults.taper_length)
         self._platform_fill.set_color(defaults.platform_fill)
+        self._platform_fill2.set_color(defaults.platform_fill2)
         self._platform_line.set_color(defaults.platform_line)
         self._platform_text.set_color(defaults.platform_text)
+        self._break_crossings.setChecked(defaults.break_crossings)
 
     def values(self) -> style_module.Style:
         return style_module.Style(
@@ -117,6 +124,8 @@ class StyleDialog(QDialog):
             branch=style_module.LineStyle(float(self._branch_width.value()), self._branch_color.color()),
             taper_length=float(self._taper.value()),
             platform_fill=self._platform_fill.color(),
+            platform_fill2=self._platform_fill2.color(),
             platform_line=self._platform_line.color(),
             platform_text=self._platform_text.color(),
+            break_crossings=bool(self._break_crossings.isChecked()),
         )

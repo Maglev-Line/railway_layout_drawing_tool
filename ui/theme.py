@@ -40,6 +40,7 @@ TRACK_COLOR = "#000000"
 MARKER_FILL_BRIDGE = "#f7f7f7"
 MARKER_FILL_TUNNEL = "#e3e6e8"
 PLATFORM_FILL = "#e53935"
+PLATFORM_FILL2 = "#ffcdd2"
 PLATFORM_LINE = "#000000"
 PLATFORM_TEXT = "#ffffff"
 LABEL_COLOR = GRAY_STRONG
@@ -77,6 +78,7 @@ CTA_OUTLINE_QSS = (
 )
 OK_BUTTON_QSS = "font-weight:bold;min-width:88px;"
 HINT_QSS = f"color:{GRAY};font-size:{FONT_HINT};"
+ACCENT_HINT_QSS = f"color:{ACCENT};font-size:{FONT_HINT};"
 FAINT_QSS = f"color:{GRAY_FAINT};font-size:{FONT_TINY};"
 TITLE_QSS = f"font-size:{FONT_TITLE};font-weight:bold;"
 SUBTITLE_QSS = f"color:{GRAY};"

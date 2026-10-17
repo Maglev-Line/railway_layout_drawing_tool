@@ -33,6 +33,8 @@ def test_style_settings_round_trip(restore_style):
             platform_fill="#ff0000",
             platform_line="#00ff00",
             platform_text="#0000ff",
+            platform_fill2="#abcdef",
+            break_crossings=True,
         )
     )
     loaded = style_module.reload()
@@ -44,6 +46,8 @@ def test_style_settings_round_trip(restore_style):
     assert loaded.taper_length == pytest.approx(33.0)
     assert loaded.platform_fill == "#ff0000"
     assert loaded.platform_text == "#0000ff"
+    assert loaded.platform_fill2 == "#abcdef"
+    assert loaded.break_crossings is True
 
 
 def test_segment_main_flag_applies_style(qapp, restore_style):
@@ -167,7 +171,7 @@ def test_editor_page_apply_style_is_one_undo_step(qapp, restore_style, monkeypat
     monkeypatch.setattr(autosave, "pending_recovery", lambda: None)
     document = Document()
     window = MainWindow()
-    window._bind_document(document, None, None)
+    window._add_tab(document, None, None)
     editor = window.editor
     scene = editor.scene()
 

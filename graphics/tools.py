@@ -11,12 +11,14 @@ from core.commands import AddItemsCommand, EditPropertiesCommand
 from graphics import style
 from graphics.items.base import LayoutItem
 from graphics.items.buffer_stop_item import BufferStopItem
+from graphics.items.connector_item import ConnectorItem
 from graphics.items.platform_item import PlatformItem
 from graphics.items.section_marker_item import SectionMarkerItem
 from graphics.items.segment_item import SegmentItem
 from graphics.items.text_item import TextItem
 from graphics.items.turnout_item import TurnoutItem
 from graphics.scene import SnapResult
+from graphics.snap_platform import snap_platform
 
 SNAP_PX = 12.0  # 端口吸附阈值（屏幕像素）
 HANDLE_PX = 7.0  # 手柄拾取半径（屏幕像素）
@@ -24,14 +26,19 @@ MIN_DRAG_PX = 5.0  # 拖拽判定阈值（屏幕像素）
 PICK_PX = 18.0  # 组合工具点选股道的宽松判定半径（屏幕像素）
 GHOST_OPACITY = 0.45
 MIN_ITEM_GAP = 1.0
+CONNECTOR_MIN_CROSS_ANGLE = 10.0  # 两条股道的夹角小于该值不算交叉
+CONNECTOR_MIN_OFFSET = 2.0  # 接点离交叉点的最小距离（单位）
 
 GROUP_BASIC = "绘制元素"
 GROUP_TURNOUT = "道岔"
 GROUP_PATTERN = "组合配线"
-TOOL_GROUPS: tuple[str, ...] = (GROUP_BASIC, GROUP_TURNOUT, GROUP_PATTERN)
+GROUP_CONNECTOR = "联络线"
+TOOL_GROUPS: tuple[str, ...] = (GROUP_BASIC, GROUP_TURNOUT, GROUP_PATTERN, GROUP_CONNECTOR)
 
 TURNOUT_HINT = "两步放置：先点主线位置，再拖出曲股方向（右键/Esc 退回上一步）"
 PATTERN_HINT = "依次点两条股道 → 移动鼠标选方向 → 再点一次生成（右键/Esc 退回上一步）"
+ISLAND_HINT = "依次点两条平行股道 → 移动鼠标定位置 → 再点一次在中间生成站台（两侧自动留默认间隔）"
+CONNECTOR_HINT = "依次点两条交叉的股道 → 移动鼠标定两个接点 → 再点一次生成（右键/Esc 退回上一步）"
 
 
 @dataclass(frozen=True)
@@ -63,9 +70,19 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("crossover_double", "交叉渡线", None, "", PATTERN_HINT, GROUP_PATTERN),
     ToolSpec("siding", "存车线", None, "", PATTERN_HINT, GROUP_PATTERN),
     ToolSpec("turnback", "折返线", None, "", PATTERN_HINT, GROUP_PATTERN),
+    ToolSpec("island_platform", "岛式站台", None, "", ISLAND_HINT, GROUP_PATTERN),
+    ToolSpec(
+        "connector_straight", "联络线（直线）", ConnectorItem, "", CONNECTOR_HINT, GROUP_CONNECTOR,
+        {"kind": "直线"},
+    ),
+    ToolSpec(
+        "connector_curve", "联络线（曲线）", ConnectorItem, "", CONNECTOR_HINT, GROUP_CONNECTOR,
+        {"kind": "曲线"},
+    ),
 )
 TOOL_SPEC_MAP = {spec.tool_id: spec for spec in TOOL_SPECS}
 PATTERN_TOOL_IDS = tuple(spec.tool_id for spec in TOOL_SPECS if spec.group == GROUP_PATTERN)
+CONNECTOR_TOOL_IDS = tuple(spec.tool_id for spec in TOOL_SPECS if spec.group == GROUP_CONNECTOR)
 
 
 def nearest_segment(
@@ -100,15 +117,25 @@ def track_of(item: LayoutItem) -> patterns.Track:
 
 
 def pattern_style() -> patterns.PatternStyle:
-    """按“区分正线”设置生成组合的线型：关闭时与所选股道一致（不变细）。"""
+    """按“区分正线”设置生成组合的线型：关闭时与所选股道一致（不变细）。
+
+    站台配色也随默认样式走，保证「岛式站台」与手绘站台观感一致。
+    """
     current = style.current()
+    platform_colors = {
+        "platform_fill": current.platform_fill,
+        "platform_fill2": current.platform_fill2,
+        "platform_line": current.platform_line,
+        "platform_text": current.platform_text,
+    }
     if not current.distinguish_main:
-        return patterns.PatternStyle()
+        return patterns.PatternStyle(**platform_colors)
     return patterns.PatternStyle(
         branch_width=current.branch.width,
         new_line_width=current.branch.width,
         new_line_color=current.branch.color,
         taper_length=current.taper_length,
+        **platform_colors,
     )
 
 
@@ -133,6 +160,10 @@ class ToolBase:
     @property
     def view(self):
         return self.manager.view
+
+    def step_hint(self, text: str) -> None:
+        """发布当前步骤指引：同时进右侧绘制指引面板与状态栏。"""
+        self.manager.set_hint(text)
 
     def activate(self) -> None:
         pass
@@ -164,6 +195,7 @@ class ToolManager(QObject):
 
     toolChanged = Signal(str)
     message = Signal(str)  # 给状态栏看的提示
+    hintChanged = Signal(str)  # 当前步骤指引（右侧绘制指引面板）
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
@@ -173,6 +205,7 @@ class ToolManager(QObject):
         self._tools: dict[str, ToolBase] = {}
         self._current: ToolBase | None = None
         self._current_id = "select"
+        self._hint = ""
 
     # ---------------- 上下文 ----------------
     def set_context(self, scene, document) -> None:
@@ -197,10 +230,26 @@ class ToolManager(QObject):
             tool = self._create_tool(tool_id)
             self._tools[tool_id] = tool
         self._current = tool
+        self._hint = ""
         if self.scene is not None:
-            tool.activate()
+            tool.activate()  # 各工具在此发布第 1 步指引
+        self.set_hint(self._hint or TOOL_SPEC_MAP[tool_id].hint)
         self.view.apply_tool_cursor()
         self.toolChanged.emit(tool_id)
+
+    # ---------------- 绘制指引 ----------------
+    def set_hint(self, text: str) -> None:
+        """发布当前步骤指引：进右侧指引面板，同时作为状态栏提示。"""
+        text = str(text or "")
+        if text == self._hint:
+            return
+        self._hint = text
+        self.hintChanged.emit(text)
+        if text:
+            self.message.emit(text)
+
+    def hint(self) -> str:
+        return self._hint
 
     def current_id(self) -> str:
         return self._current_id
@@ -220,6 +269,8 @@ class ToolManager(QObject):
             return BandTool(self, spec)
         if tool_id in PATTERN_TOOL_IDS:
             return PatternTool(self, spec)
+        if tool_id in CONNECTOR_TOOL_IDS:
+            return ConnectorTool(self, spec)
         if (spec.preset or {}).get("kind"):
             return TurnoutTool(self, spec)
         return PlaceTool(self, spec)
@@ -271,6 +322,7 @@ class SelectTool(ToolBase):
     def activate(self) -> None:
         if self.view is not None:
             self.view.setCursor(Qt.CursorShape.ArrowCursor)
+        self.step_hint("点选或框选元素：拖动移动，拖手柄改尺寸；空格+拖拽平移画布")
 
     def deactivate(self) -> None:
         self._finish_drag(commit=False)
@@ -327,6 +379,7 @@ class SelectTool(ToolBase):
             "press": QPointF(pos),
             "moved": False,
             "orig": [(it, QPointF(it.pos())) for it in selected],
+            "widths": [(it, float(it.get_prop("width"))) for it in selected if isinstance(it, PlatformItem)],
             "exclude": set(selected),
         }
         return True
@@ -342,12 +395,17 @@ class SelectTool(ToolBase):
             item = drag["item"]
             snapped = self._snap(pos, exclude={item})
             item.apply_handle(drag["role"], QPointF(snapped.pos))
+            if isinstance(item, PlatformItem) and drag["role"] == "width":
+                snap_platform(item, self.scene, self.manager.px_threshold(SNAP_PX))
             return True
         delta = pos - drag["press"]
         delta = self._adjust_delta(drag, delta)
         drag["moved"] = drag["moved"] or abs(delta.x()) > 1e-6 or abs(delta.y()) > 1e-6
         for item, origin in drag["orig"]:
             item.setPos(origin + delta)
+        for item, _origin in drag["orig"]:
+            if isinstance(item, PlatformItem) and snap_platform(item, self.scene, self.manager.px_threshold(SNAP_PX)):
+                drag["moved"] = True  # 吸附也会改动位置/宽度，必须记入撤销
         return True
 
     def mouse_release(self, event, pos: QPointF) -> bool:
@@ -410,12 +468,20 @@ class SelectTool(ToolBase):
             return
         if not drag["moved"]:
             return
+        widths = dict(drag.get("widths") or ())
         entries = []
         for item, origin in drag["orig"]:
+            props: dict[str, tuple] = {}
             if item.pos() != origin:
-                entries.append(
-                    (item, {"x": (origin.x(), item.pos().x()), "y": (origin.y(), item.pos().y())})
-                )
+                props["x"] = (origin.x(), item.pos().x())
+                props["y"] = (origin.y(), item.pos().y())
+            old_width = widths.get(item)
+            if old_width is not None:
+                new_width = float(item.get_prop("width"))
+                if abs(new_width - old_width) > 1e-6:
+                    props["width"] = (old_width, new_width)  # 吸附可能顺带调整站台宽度
+            if props:
+                entries.append((item, props))
         if entries:
             self.manager.push(EditPropertiesCommand(self.scene, entries, "移动元素", merge_key="move"))
 
@@ -471,6 +537,9 @@ class PlaceTool(GhostTool):
         if self.view is not None:
             self.view.setCursor(Qt.CursorShape.CrossCursor)
         self._spawn_ghost()
+        self.step_hint(
+            f"点击放置{self.spec.name}；靠近其它元素的股道/端口会自动对齐，右键/Esc 结束"
+        )
 
     def deactivate(self) -> None:
         self._drop_ghost()
@@ -529,6 +598,8 @@ class TurnoutTool(GhostTool):
 
     tool_id = "turnout_single"
     name = "道岔"
+    STEP_MAIN = "第 1 步：点击主线落点（贴合股道中线或吸附端口会自动对位）"
+    STEP_BRANCH = "第 2 步：拖动定曲股方向后点击放置；右键/Esc 退回上一步"
 
     def __init__(self, manager: ToolManager, spec: ToolSpec):
         super().__init__(manager, spec)
@@ -539,6 +610,7 @@ class TurnoutTool(GhostTool):
         if self.view is not None:
             self.view.setCursor(Qt.CursorShape.CrossCursor)
         self._spawn_ghost()
+        self.step_hint(self.STEP_MAIN)
 
     def deactivate(self) -> None:
         self._main = None
@@ -549,6 +621,7 @@ class TurnoutTool(GhostTool):
     def cancel(self) -> None:
         """右键 / Esc：退回选主线位置（幽灵保留，可继续放置）。"""
         self._main = None
+        self.step_hint(self.STEP_MAIN)
         if self.scene is not None:
             self.scene.show_snap(None)
 
@@ -578,11 +651,13 @@ class TurnoutTool(GhostTool):
             self._ghost.setRotation(rotation)
             self._main = snap
             self.scene.show_snap(snap)
+            self.step_hint(self.STEP_BRANCH)
             return True
         self._apply_branch(self._ghost, pos)
         self._commit_ghost()
         self._main = None
         self._spawn_ghost()
+        self.step_hint(self.STEP_MAIN)
         self.mouse_move(event, pos)
         return True
 
@@ -596,10 +671,10 @@ class TurnoutTool(GhostTool):
             return ghost_pos, rotation, snap
         track = self._track_at(pos, exclude={ghost})
         if track is not None:
-            angle, foot = track
+            item, angle, foot = track
             offset = turnout.center_offset(str(ghost.get_prop("kind")), float(ghost.get_prop("length")))
             origin = geometry.point_from(foot, angle + 180.0, offset)
-            return origin, angle, SnapResult("track", QPointF(foot))
+            return origin, angle, SnapResult("track", QPointF(foot), item=item)
         return QPointF(snap.pos), float(ghost.rotation()), snap
 
     def _align_to_port(self, ghost, port) -> tuple[QPointF, float]:
@@ -623,13 +698,13 @@ class TurnoutTool(GhostTool):
         offset = geometry.rotate_point(local.pos, rotation)
         return QPointF(port.pos.x() - offset.x(), port.pos.y() - offset.y()), rotation
 
-    def _track_at(self, pos: QPointF, exclude=()) -> tuple[float, QPointF] | None:
-        """光标附近的股道：返回 (方向角, 中线上的垂足)，超出阈值返回 None。"""
+    def _track_at(self, pos: QPointF, exclude=()) -> tuple[LayoutItem, float, QPointF] | None:
+        """光标附近的股道：返回 (图元, 方向角, 中线上的垂足)，超出阈值返回 None。"""
         hit = nearest_segment(self.scene, pos, self.manager.snap_threshold(), exclude)
         if hit is None:
             return None
-        _item, angle, foot = hit
-        return angle, foot
+        item, angle, foot = hit
+        return item, angle, foot
 
     # ---------------- 第二步：曲股方向 ----------------
     def _apply_branch(self, ghost, pos: QPointF) -> SnapResult:
@@ -645,9 +720,9 @@ class TurnoutTool(GhostTool):
         else:
             track = self._track_at(pos, exclude={ghost})
             if track is not None:
-                angle, foot = track
+                item, angle, foot = track
                 target = geometry.toward_angle(angle, cursor)
-                snap = SnapResult("track", QPointF(foot))
+                snap = SnapResult("track", QPointF(foot), item=item)
         if target is None:
             step = 0.0 if self.document is None else float(self.document.angle_step)
             local = geometry.snap_angle_signed(geometry.signed_angle_diff(cursor, main), step)
@@ -668,6 +743,8 @@ class PatternTool(ToolBase):
     整组作为一次撤销步骤。
     """
 
+    PICK_SECOND = "已选中第一条股道，请再点一条与它基本平行的相邻股道"
+
     def __init__(self, manager: ToolManager, spec: ToolSpec):
         super().__init__(manager)
         self.spec = spec
@@ -681,6 +758,7 @@ class PatternTool(ToolBase):
     def activate(self) -> None:
         if self.view is not None:
             self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.step_hint(self.spec.hint)
 
     def deactivate(self) -> None:
         self._clear_ghosts()
@@ -697,6 +775,7 @@ class PatternTool(ToolBase):
         self._frame = None
         self._data = None
         self._last_error = ""
+        self.step_hint(self.PICK_SECOND if self._tracks else self.spec.hint)
         if self.scene is not None:
             self.scene.show_snap(None)
 
@@ -720,7 +799,7 @@ class PatternTool(ToolBase):
             return True
         hit = nearest_segment(self.scene, pos, self.manager.px_threshold(PICK_PX))
         if hit is not None:
-            self.scene.show_snap(SnapResult("track", hit[2]))
+            self.scene.show_snap(SnapResult("track", hit[2], item=hit[0]))
         return False
 
     # ---------------- 选股道 ----------------
@@ -736,7 +815,7 @@ class PatternTool(ToolBase):
         item.setSelected(True)
         self._tracks.append((item, track_of(item)))
         if len(self._tracks) < 2:
-            self._report("已选中第一条股道，请再点一条与它基本平行的相邻股道")
+            self._report(self.PICK_SECOND)
             return True
         frame = self._make_frame()
         if frame is None:
@@ -784,7 +863,7 @@ class PatternTool(ToolBase):
             self._report(str(error))
             return
         self._last_error = ""
-        self.scene.show_snap(SnapResult("track", frame.point(t, 0.0)))
+        self.scene.show_snap(SnapResult("track", frame.point(t, 0.0), item=self._tracks[0][0]))
         if data == self._data:
             return
         self._data = data
@@ -809,6 +888,8 @@ class PatternTool(ToolBase):
         for item in items:
             item.setSelected(True)
         self._reset_tracks()
+        self._last_error = ""
+        self.step_hint(self.spec.hint)
         self.manager.message.emit(f"已生成{self.spec.name}：{len(items)} 个元素（Ctrl+Z 可撤销）")
 
     def _clear_ghosts(self) -> None:
@@ -820,7 +901,7 @@ class PatternTool(ToolBase):
     def _report(self, text: str) -> None:
         if text and text != self._last_error:
             self._last_error = text
-            self.manager.message.emit(text)
+            self.step_hint(text)
 
 
 class SegmentTool(ToolBase):
@@ -828,6 +909,8 @@ class SegmentTool(ToolBase):
 
     tool_id = "segment"
     name = "股道线段"
+    STEP_START = "第 1 步：点击定起点（也可按住直接拖拽一次成型；吸到端点可续轨）"
+    STEP_END = "第 2 步：点击定终点；Shift 临时脱离角度吸附，右键/Esc 结束"
 
     def __init__(self, manager: ToolManager):
         super().__init__(manager)
@@ -839,20 +922,21 @@ class SegmentTool(ToolBase):
     def activate(self) -> None:
         if self.view is not None:
             self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.step_hint(self.STEP_START)
 
     def deactivate(self) -> None:
-        self.finish_chain()
-        self._clear_ghost()
         self._anchor = None
         self._mode = ""
+        self.finish_chain()
+        self._clear_ghost()
         if self.scene is not None:
             self.scene.show_snap(None)
 
     def cancel(self) -> None:
-        self.finish_chain()
-        self._clear_ghost()
         self._anchor = None
         self._mode = ""
+        self.finish_chain()
+        self._clear_ghost()
         if self.scene is not None:
             self.scene.show_snap(None)
 
@@ -864,9 +948,11 @@ class SegmentTool(ToolBase):
         if event.button() != Qt.MouseButton.LeftButton:
             return False
         snap = self._snap(pos, anchor=self._anchor)
+        self.scene.show_snap(snap)
         if self._anchor is None:
             self._anchor = snap
             self._mode = "press"
+            self.step_hint(self.STEP_END)
         else:
             self._commit_segment(self._anchor, snap)
             self._anchor = snap
@@ -952,6 +1038,197 @@ class SegmentTool(ToolBase):
         if self._chain_open and self.document is not None:
             self.document.undo_stack.endMacro()
         self._chain_open = False
+        if self._anchor is None:
+            self.step_hint(self.STEP_START)
+
+
+class ConnectorTool(GhostTool):
+    """联络线：依次点两条交叉的股道 → 移动鼠标定两个接点 → 再点一次生成。
+
+    光标相对交叉点的位置决定两个接点：沿每条股道各自的投影（网格吸附）即为接点，
+    曲线型还会顺着两条股道各自的走向出/入（examples/example6 的画法）。
+    只新增联络线本身，不改动原有股道。
+    """
+
+    PICK_SECOND = "已选中第一条股道，请再点一条与它交叉的股道"
+
+    def __init__(self, manager: ToolManager, spec: ToolSpec):
+        super().__init__(manager, spec)
+        self._lines: list[tuple[LayoutItem, QPointF, QPointF, float]] = []
+        self._cross: QPointF | None = None
+        self._data: dict | None = None
+        self._last_error = ""
+
+    # ---------------- 生命周期 ----------------
+    def activate(self) -> None:
+        if self.view is not None:
+            self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.step_hint(self.spec.hint)
+
+    def deactivate(self) -> None:
+        self._drop_ghost()
+        self._reset()
+        if self.scene is not None:
+            self.scene.show_snap(None)
+
+    def cancel(self) -> None:
+        """右键 / Esc：退回上一步（两条股道 → 一条 → 未选）。"""
+        self._drop_ghost()
+        self._data = None
+        self._cross = None
+        if self._lines:
+            item = self._lines.pop()[0]
+            if item.scene() is not None:
+                item.setSelected(False)
+        self._last_error = ""
+        self.step_hint(self.PICK_SECOND if self._lines else self.spec.hint)
+        if self.scene is not None:
+            self.scene.show_snap(None)
+
+    # ---------------- 事件 ----------------
+    def mouse_press(self, event, pos: QPointF) -> bool:
+        if event.button() == Qt.MouseButton.RightButton:
+            self.cancel()
+            return True
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        if len(self._lines) < 2:
+            return self._pick(pos)
+        if self._data is None:
+            self._refresh(pos)
+        self._commit()
+        return True
+
+    def mouse_move(self, event, pos: QPointF) -> bool:
+        if len(self._lines) == 2:
+            self._refresh(pos)
+            return True
+        hit = nearest_segment(self.scene, pos, self.manager.px_threshold(PICK_PX))
+        if hit is not None:
+            self.scene.show_snap(SnapResult("track", hit[2], item=hit[0]))
+        return False
+
+    # ---------------- 选股道 ----------------
+    def _pick(self, pos: QPointF) -> bool:
+        hit = nearest_segment(self.scene, pos, self.manager.px_threshold(PICK_PX))
+        if hit is None or not isinstance(hit[0], SegmentItem):
+            self._report(f"{self.spec.name}：请点击股道线段")
+            return True
+        item = hit[0]
+        if any(item is line[0] for line in self._lines):
+            self._report("请选择另一条股道")
+            return True
+        item.setSelected(True)
+        self._lines.append(self._line_of(item))
+        if len(self._lines) < 2:
+            self._report(self.PICK_SECOND)
+            return True
+        cross = self._crossing()
+        if cross is None:
+            self.cancel()
+            self._report("两条股道没有交叉：请点一条与它交叉的股道")
+            return True
+        self._cross = cross
+        self._report(f"{self.spec.name}：移动鼠标调整两个接点，点击生成")
+        return True
+
+    @staticmethod
+    def _line_of(item: LayoutItem) -> tuple[LayoutItem, QPointF, QPointF, float]:
+        start = item.mapToScene(QPointF(0.0, 0.0))
+        end = item.mapToScene(QPointF(float(item.get_prop("length")), 0.0))
+        return item, start, end, geometry.angle_of(start, end)
+
+    def _crossing(self) -> QPointF | None:
+        _item_a, a_start, a_end, _angle_a = self._lines[0]
+        _item_b, b_start, b_end, _angle_b = self._lines[1]
+        hit = geometry.segment_intersection(a_start, a_end, b_start, b_end, CONNECTOR_MIN_CROSS_ANGLE)
+        return None if hit is None else hit[0]
+
+    # ---------------- 预览与生成 ----------------
+    def _attachments(self, cursor: QPointF) -> tuple[QPointF, QPointF, float, float] | None:
+        """由光标推出 (起点, 终点, 起点切向角, 终点切向角)（切向角相对弦线）。"""
+        cross = self._cross
+        if cross is None:
+            return None
+        _item_a, _a_start, _a_end, angle_a = self._lines[0]
+        _item_b, _b_start, _b_end, angle_b = self._lines[1]
+        snap = self.scene.snap_point(cursor, self.manager.snap_threshold())
+        base = snap.pos
+        t_a = geometry.project_on_direction(cross, base, angle_a)
+        t_b = geometry.project_on_direction(cross, base, angle_b)
+        document = self.document
+        if snap.kind != "port" and document is not None and document.snap_grid:
+            t_a = geometry.snap_value(t_a, float(document.grid_size))
+            t_b = geometry.snap_value(t_b, float(document.grid_size))
+        if abs(t_a) < CONNECTOR_MIN_OFFSET or abs(t_b) < CONNECTOR_MIN_OFFSET:
+            self._report("接点离交叉点太近：请把光标移到交叉点的一侧")
+            return None
+        start = geometry.point_from(cross, angle_a, t_a)
+        end = geometry.point_from(cross, angle_b, t_b)
+        if geometry.distance(start, end) < geometry.MIN_SEGMENT_LENGTH:
+            self._report("两个接点几乎重合：请把光标移远一些")
+            return None
+        rotation = geometry.angle_of(start, end)
+        # 起点顺着第一条股道指向交叉点，终点顺着第二条股道离开交叉点
+        tangent_a = angle_a if t_a < 0.0 else angle_a + 180.0
+        tangent_b = angle_b if t_b > 0.0 else angle_b + 180.0
+        return (
+            start,
+            end,
+            geometry.signed_angle_diff(tangent_a, rotation),
+            geometry.signed_angle_diff(tangent_b, rotation),
+        )
+
+    def _refresh(self, cursor: QPointF) -> None:
+        attach = self._attachments(cursor)
+        if attach is None:
+            return
+        start, end, start_angle, end_angle = attach
+        if self._ghost is None:
+            self._spawn_ghost()
+        ghost = self._ghost
+        if ghost is None:
+            return
+        rotation = geometry.angle_of(start, end)
+        length = geometry.distance(start, end)
+        ghost.setPos(start)
+        ghost.setRotation(rotation)
+        ghost.set_prop("length", length)
+        ghost.set_prop("start_angle", start_angle)
+        ghost.set_prop("end_angle", end_angle)
+        self._data = {
+            "start": start,
+            "length": length,
+            "rotation": rotation,
+            "start_angle": start_angle,
+            "end_angle": end_angle,
+        }
+        self._last_error = ""
+        self.scene.show_snap(SnapResult("track", QPointF(end), item=self._lines[1][0]))
+
+    def _commit(self) -> None:
+        if self._data is None or self._ghost is None:
+            return
+        placed = self._commit_ghost()
+        if placed is None:
+            return
+        self._reset()
+        self.step_hint(self.spec.hint)
+        self.manager.message.emit(f"已生成{self.spec.name}（Ctrl+Z 可撤销）")
+
+    def _reset(self) -> None:
+        for item, *_rest in self._lines:
+            if item.scene() is not None:
+                item.setSelected(False)
+        self._lines.clear()
+        self._cross = None
+        self._data = None
+        self._last_error = ""
+
+    def _report(self, text: str) -> None:
+        if text and text != self._last_error:
+            self._last_error = text
+            self.step_hint(text)
 
 
 class RectTool(GhostTool):
@@ -964,6 +1241,7 @@ class RectTool(GhostTool):
     def activate(self) -> None:
         if self.view is not None:
             self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.step_hint(f"拖出{self.spec.name}范围：按住左键拖拽定大小，松开完成（可吸网格/端点）")
 
     def deactivate(self) -> None:
         self._drop_ghost()
@@ -977,6 +1255,7 @@ class RectTool(GhostTool):
         if event.button() != Qt.MouseButton.LeftButton:
             return False
         self._start = QPointF(self._snap_free(pos).pos)
+        self.step_hint("拖到合适大小后松开左键完成；之后可用手柄调长度/宽度")
         return True
 
     def mouse_move(self, event, pos: QPointF) -> bool:
@@ -1021,6 +1300,9 @@ class RectTool(GhostTool):
             ghost.setRotation(90.0)
             ghost.set_prop("length", height)
             ghost.set_prop("width", width)
+        if isinstance(ghost, PlatformItem):
+            # 长边靠近平行股道时按默认间隔吸附（预览与最终结果一致）
+            snap_platform(ghost, self.scene, self.manager.px_threshold(SNAP_PX))
 
 
 class BandTool(GhostTool):
@@ -1033,6 +1315,7 @@ class BandTool(GhostTool):
     def activate(self) -> None:
         if self.view is not None:
             self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.step_hint(f"第 1 步：点击定{self.spec.name}起点（可吸附端点/端口）")
 
     def deactivate(self) -> None:
         self._drop_ghost()
@@ -1053,6 +1336,7 @@ class BandTool(GhostTool):
         if event.button() != Qt.MouseButton.LeftButton:
             return False
         self._start = self._snap_free(pos)
+        self.step_hint("第 2 步：沿方向拖拽定长度，松开完成；Shift 脱离角度吸附")
         return True
 
     def mouse_move(self, event, pos: QPointF) -> bool:

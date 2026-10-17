@@ -133,6 +133,34 @@ def distance_to_segment(point: QPointF, start: QPointF, end: QPointF) -> float:
     return distance(point, closest_point_on_segment(point, start, end))
 
 
+# 交叉断开：空隙半长 = 该倍数 × 被跨越股道的线宽（取自 examples/example6 实测 ≈1.4）
+CROSS_GAP_FACTOR = 1.4
+MIN_CROSS_ANGLE = 5.0  # 夹角小于该值视为几乎平行，不做交叉断开
+
+
+def segment_intersection(
+    a1: QPointF, a2: QPointF, b1: QPointF, b2: QPointF, min_angle: float = MIN_CROSS_ANGLE
+) -> tuple[QPointF, float] | None:
+    """两条线段的交点：返回 (交点, 交点在第一条线段上的比例 t∈[0,1])；不相交返回 None。
+
+    夹角小于 min_angle 视为平行/重合，返回 None（避免擦角交叉算出巨长空隙）。
+    """
+    dx_a, dy_a = a2.x() - a1.x(), a2.y() - a1.y()
+    dx_b, dy_b = b2.x() - b1.x(), b2.y() - b1.y()
+    denom = dx_a * dy_b - dy_a * dx_b
+    if abs(denom) <= 1e-9:
+        return None
+    cross_angle = abs(math.degrees(math.atan2(denom, dx_a * dx_b + dy_a * dy_b)))
+    cross_angle = min(cross_angle, 180.0 - cross_angle)
+    if cross_angle < min_angle:
+        return None
+    t = ((b1.x() - a1.x()) * dy_b - (b1.y() - a1.y()) * dx_b) / denom
+    u = ((b1.x() - a1.x()) * dy_a - (b1.y() - a1.y()) * dx_a) / denom
+    if not (0.0 <= t <= 1.0 and 0.0 <= u <= 1.0):
+        return None
+    return QPointF(a1.x() + t * dx_a, a1.y() + t * dy_a), t
+
+
 # ---------------- 曲线 ----------------
 def cubic_point(p0: QPointF, c1: QPointF, c2: QPointF, p3: QPointF, t: float) -> QPointF:
     s = 1.0 - t

@@ -15,10 +15,11 @@ def test_main_window_smoke(qapp, monkeypatch):
     window = MainWindow()
     document = Document()
     segment = registry.create_default("segment")
-    window._bind_document(document, [segment], None)
+    window._add_tab(document, [segment], None)
 
-    assert window._document is document
-    assert window.stack.currentWidget() is window.editor
+    assert window.document() is document
+    assert window.stack.currentWidget() is window.tabs
+    assert window.tabs.count() == 1
     assert window.editor.scene().layout_items() == [segment]
     assert window.windowTitle().endswith("铁路配线图绘制器")
     assert not document.is_dirty()
@@ -94,7 +95,7 @@ def test_property_panel_refresh_has_no_popups_and_keeps_rows(qapp, monkeypatch):
     document = Document()
     segment = registry.create_default("segment")
     segment.set_prop("length", 120.0)
-    window._bind_document(document, [segment], None)
+    window._add_tab(document, [segment], None)
 
     popups: list[str] = []
 

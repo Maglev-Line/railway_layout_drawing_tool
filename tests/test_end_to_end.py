@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 
 import pytest
@@ -44,7 +45,7 @@ def test_end_to_end_workflow(qapp, tmp_path, monkeypatch):
     document = Document()
     document.title = "演练站"
     document.grid_size = 10.0
-    window._bind_document(document, None, None)
+    window._add_tab(document, None, None)
     editor = window.editor
     editor.view.reset_zoom()  # 固定 100% 缩放，令吸附阈值可预期
     manager = editor.tool_manager
@@ -116,19 +117,26 @@ def test_end_to_end_workflow(qapp, tmp_path, monkeypatch):
     assert len(scene.layout_items()) == before
     editor.finish_chain()
 
-    # 5) 保存 → 重开
+    # 5) 保存 → 复制一份打开（新标签页）→ 再打开同一文件（切回已有标签页）
     path = tmp_path / "演练站.rld"
     document.file_path = str(path)
     assert window.save_project() is True
     assert path.exists()
     assert not document.is_dirty()
 
-    window.open_project(str(path))
-    reopened = window._document
-    assert reopened is not None
+    copy_path = tmp_path / "演练站-副本.rld"
+    shutil.copyfile(path, copy_path)
+    window.open_project(str(copy_path))
+    reopened = window.document()
+    assert reopened is not None and reopened is not document
     assert reopened.title == "演练站"
+    assert window.tabs.count() == 2
     assert len(_placed(window.editor.scene(), "segment")) == 3
     assert not reopened.is_dirty()
+
+    window.open_project(str(copy_path))
+    assert window.tabs.count() == 2  # 同一文件已在标签页中：切回该页，不重复打开
+    assert window.document() is reopened
 
     # 6) 导出 PDF
     pdf_path = tmp_path / "演练站.pdf"
@@ -148,7 +156,7 @@ def test_autosave_snapshot_and_cleanup(qapp, tmp_path, monkeypatch):
     window = MainWindow()
     document = Document()
     segment = registry.create_default("segment")
-    window._bind_document(document, [segment], None)
+    window._add_tab(document, [segment], None)
     document.mark_dirty()
     window.autosave.save_now()
 

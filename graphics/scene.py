@@ -18,11 +18,15 @@ MAX_GRID_LINES = 4000
 
 @dataclass(frozen=True)
 class SnapResult:
-    """一次吸附结果：kind 为 port / grid / angle / free。"""
+    """一次吸附结果：kind 为 port / track / grid / angle / free。
+
+    item 是这次吸附“锚定”到的既有元素（光标贴着它的端口/中线），供绘制指引面板显示。
+    """
 
     kind: str
     pos: QPointF
     port: Port | None = None
+    item: LayoutItem | None = None
 
 
 class SnapMarkerItem(QGraphicsItem):
@@ -57,6 +61,7 @@ class LayoutScene(QGraphicsScene):
 
     itemsChanged = Signal(list)
     textEditRequested = Signal(object)
+    snapChanged = Signal(object)  # 当前吸附结果（SnapResult 或 None），绘制指引据此显示锚定元素
 
     CANVAS_RECT = QRectF(-50000.0, -50000.0, 100000.0, 100000.0)
 
@@ -94,6 +99,15 @@ class LayoutScene(QGraphicsScene):
     # ---------------- 图元集合 ----------------
     def layout_items(self) -> list[LayoutItem]:
         return [item for item in self.items() if isinstance(item, LayoutItem)]
+
+    def reference_items(self) -> list[LayoutItem]:
+        """可作为绘制参照的既有元素：排除预览幽灵等不可选中对象，按从上到下、从左到右排序。"""
+        candidates = [
+            item
+            for item in self.layout_items()
+            if item.is_printable() and bool(item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        ]
+        return sorted(candidates, key=lambda it: (it.zValue(), it.pos().y(), it.pos().x(), it.uid))
 
     def clear_layout(self) -> None:
         for item in self.layout_items():
@@ -148,7 +162,7 @@ class LayoutScene(QGraphicsScene):
     def snap_point(self, pos: QPointF, max_dist: float, exclude=(), use_grid: bool = True) -> SnapResult:
         port = self.nearest_port(pos, max_dist, exclude)
         if port is not None:
-            return SnapResult("port", QPointF(port.pos), port)
+            return SnapResult("port", QPointF(port.pos), port, port.item)
         document = self.document
         if use_grid and document is not None and document.snap_grid:
             return SnapResult("grid", geometry.snap_point_to_grid(pos, document.grid_size))
@@ -157,9 +171,11 @@ class LayoutScene(QGraphicsScene):
     def show_snap(self, snap: SnapResult | None) -> None:
         if snap is None or snap.kind == "free":
             self._snap_marker.hide()
+            self.snapChanged.emit(None)
             return
         self._snap_marker.setPos(snap.pos)
         self._snap_marker.show()
+        self.snapChanged.emit(snap)
 
     # ---------------- 导出模式 ----------------
     def begin_export(self) -> list:

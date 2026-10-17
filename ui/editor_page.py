@@ -20,6 +20,7 @@ from graphics.items.base import LayoutItem
 from graphics.scene import LayoutScene
 from graphics.tools import ToolManager
 from ui.canvas_view import CanvasView
+from ui.guide_panel import DrawingGuidePanel, describe_item
 from ui.property_panel import ANGLE_STEP_CHOICES, FOCUS_FIELD_ORDER, PropertyPanel
 from ui.tool_panel import ToolPanel
 
@@ -49,6 +50,7 @@ class EditorPage(QWidget):
 
         self.tool_panel = ToolPanel(self.tool_manager, self)
         self.property_panel = PropertyPanel(self)
+        self.guide_panel = DrawingGuidePanel(self)
 
         controls = QWidget(self)
         row = QHBoxLayout(controls)
@@ -87,7 +89,13 @@ class EditorPage(QWidget):
         right = QWidget(self)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(self.property_panel)
+        self._right_splitter = QSplitter(Qt.Orientation.Vertical, right)
+        self._right_splitter.addWidget(self.guide_panel)
+        self._right_splitter.addWidget(self.property_panel)
+        self._right_splitter.setStretchFactor(0, 0)
+        self._right_splitter.setStretchFactor(1, 1)
+        self._right_splitter.setSizes([280, 420])
+        right_layout.addWidget(self._right_splitter)
         right.setMinimumWidth(280)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -107,6 +115,8 @@ class EditorPage(QWidget):
 
         self.tool_panel.toolSelected.connect(self.tool_manager.set_tool)
         self.tool_manager.toolChanged.connect(self._on_tool_changed)
+        self.tool_manager.hintChanged.connect(self.guide_panel.set_step)
+        self.guide_panel.locateRequested.connect(self._locate_item)
         self.view.zoomChanged.connect(self.zoomChanged.emit)
         self.view.cursorMoved.connect(self.cursorMoved.emit)
         self.property_panel.deleteRequested.connect(self.delete_selected)
@@ -126,6 +136,8 @@ class EditorPage(QWidget):
 
         scene = LayoutScene(document, self)
         scene.textEditRequested.connect(self._on_edit_requested)
+        scene.itemsChanged.connect(self._on_items_changed)
+        scene.snapChanged.connect(self._on_snap_changed)
         self._scene = scene
         self._document = document
         self.view.setScene(scene)
@@ -137,6 +149,8 @@ class EditorPage(QWidget):
             scene.notify_items_changed(items)
         document.settingsChanged.connect(self._sync_controls)
         self._sync_controls()
+        self.guide_panel.set_anchor(None)
+        self._refresh_guide_items()
         self.view.fit_to_content()
 
     def reload_document(self, document: Document, items: list[LayoutItem] | None = None) -> None:
@@ -149,15 +163,50 @@ class EditorPage(QWidget):
         self.set_document(document, items)
 
     def _disconnect_scene(self, scene: LayoutScene) -> None:
-        try:
-            scene.textEditRequested.disconnect(self._on_edit_requested)
-        except (RuntimeError, TypeError):
-            pass
+        for signal, slot in (
+            (scene.textEditRequested, self._on_edit_requested),
+            (scene.itemsChanged, self._on_items_changed),
+            (scene.snapChanged, self._on_snap_changed),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
 
     def _on_edit_requested(self, item: LayoutItem) -> None:
         names = {field.name for field in item.property_schema()}
         target = next((name for name in FOCUS_FIELD_ORDER if name in names), "")
         self.property_panel.focus_field(target)
+
+    # ---------------- 绘制指引 ----------------
+    def _on_items_changed(self, _items) -> None:
+        self._refresh_guide_items()
+
+    def _refresh_guide_items(self) -> None:
+        scene = self._scene
+        self.guide_panel.set_items(scene.reference_items() if scene is not None else [])
+
+    def _on_snap_changed(self, snap) -> None:
+        """光标吸附到某个既有元素时，把该元素作为「锚定参照」显示在指引面板。"""
+        item = getattr(snap, "item", None)
+        if item is None:
+            self.guide_panel.set_anchor(None)
+            return
+        detail = ""
+        if getattr(snap, "port", None) is not None:
+            detail = f"端口：{snap.port.name}"
+        elif getattr(snap, "kind", "") == "track":
+            detail = "股道中线"
+        self.guide_panel.set_anchor(item, detail)
+
+    def _locate_item(self, item: LayoutItem) -> None:
+        """把参照元素设为当前选择并居中显示：只做定位，不移动它。"""
+        if self._scene is None or item.scene() is not self._scene:
+            return
+        self._scene.clearSelection()
+        item.setSelected(True)
+        self.view.centerOn(item.scene_center())
+        self.statusMessage.emit(f"已定位：{describe_item(item)}（元素未被移动）")
 
     # ---------------- 控制行 ----------------
     def _sync_controls(self, *_args) -> None:
@@ -205,6 +254,8 @@ class EditorPage(QWidget):
 
     # ---------------- 工具 ----------------
     def _on_tool_changed(self, tool_id: str) -> None:
+        self.guide_panel.set_anchor(None)
+        self._refresh_guide_items()
         self.toolChanged.emit(tool_id)
 
     def cancel_tool(self) -> None:

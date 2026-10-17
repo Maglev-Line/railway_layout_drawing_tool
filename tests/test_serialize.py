@@ -9,7 +9,7 @@ from core import registry, serialize
 from core.model import Document
 from graphics.scene import LayoutScene
 
-TYPE_IDS = ("segment", "turnout", "platform", "buffer_stop", "section_marker", "text")
+TYPE_IDS = ("segment", "turnout", "platform", "buffer_stop", "section_marker", "text", "connector")
 
 
 def _build_scene(document: Document) -> LayoutScene:
